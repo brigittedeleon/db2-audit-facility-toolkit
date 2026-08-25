@@ -4,6 +4,7 @@ This guide explains how customers can use the DB2 audit facility toolkit for the
 
 1. Download audit files and load them into Db2 tables so they can review audit logs within a given time range
 2. Download `.del` files and convert them to CSV reports for offline review
+3. Download binary audit logs to a Db2 server, extract DEL files locally, then either push the DELs back to COS or copy them directly to a Db2WaaS instance to load into tables
 
 For module details and command references, see the main [`README.md`](../README.md), the converter guide in [`converter/README.md`](../converter/README.md), and the loader guide in [`loader/README.md`](../loader/README.md).
 
@@ -258,7 +259,116 @@ python converter/db2audit_converter.py --convert-only \
 
 ---
 
-## 4. If you need binary audit extraction first
+## 4. Use case 3: Extract on a Db2 server, then push DELs to COS or load into Db2WaaS
+
+Use this workflow when your audit logs are binary files on a Db2 server machine and you want to either archive the extracted DEL files back to COS for later use, or load them directly into a Db2WaaS (Db2 on Cloud) instance.
+
+### What this workflow does
+
+1. Downloads binary audit log files from COS to the Db2 server via `db2RemStgManager`
+2. Extracts the binary logs to DEL format using `db2audit` on the Db2 server
+3. Either:
+   - **Option A** — Uploads the extracted DEL files back to a COS bucket so they can be consumed by any other toolkit workflow
+   - **Option B** — Copies the DEL files to the Db2WaaS instance and loads them into audit tables using the loader
+
+### Prerequisites
+
+- The toolkit must run on the Db2 server machine (requires `db2inst1` or equivalent access)
+- `db2RemStgManager` must be configured with a COS alias on the Db2 server
+- For Option B: JDBC connection details for your Db2WaaS instance and `db2jcc4.jar` on the `CLASSPATH`
+
+### Step 1: Extract binary logs to DEL files on the Db2 server
+
+Run the converter in extract-only mode to download the binary audit files from COS via `db2RemStgManager` and extract them to DEL format locally.
+
+```bash
+python converter/db2audit_converter.py --extract \
+  --cos-alias MY_COS_ALIAS \
+  --binary-files db2audit.db.BLUDB.log.0.20250115000000000000 \
+                 db2audit.db.BLUDB.log.0.20250115235959000000 \
+  --del-dir ./del_files
+```
+
+This produces DEL files under `./del_files` with filenames matching the pattern:
+
+```text
+db2audit.db.BLUDB.log.<n>.<timestamp>.<CATEGORY>.del
+```
+
+---
+
+### Option A: Push extracted DEL files back to COS
+
+Use this option when you want to archive the extracted DELs to COS so that other team members or machines can run converter or loader workflows against them later.
+
+Use any S3-compatible CLI or the IBM Cloud COS SDK to upload the DEL files. Example using the AWS CLI configured for IBM COS:
+
+```bash
+aws s3 cp ./del_files/ s3://my-audit-bucket/del/ \
+  --recursive \
+  --endpoint-url https://s3.us-south.cloud-object-storage.appdomain.cloud
+```
+
+After uploading, team members can use [Use case 1](#2-use-case-1-load-audit-data-into-db2-tables-for-time-range-review) or [Use case 2](#3-use-case-2-download-del-files-and-convert-them-to-csv-reports) against the bucket as normal.
+
+---
+
+### Option B: Copy DEL files to Db2WaaS and load into tables
+
+Use this option when you want to load the extracted DELs directly into a Db2WaaS (Db2 on Cloud) instance using the loader.
+
+#### Step B-1: Transfer the DEL files to a machine with JDBC access to Db2WaaS
+
+Copy the DEL files from the Db2 server to a machine (or the same machine) that has JDBC connectivity to your Db2WaaS instance:
+
+```bash
+scp -r ./del_files user@loader-machine:/home/user/del_files
+```
+
+Or, if the loader runs on the same Db2 server machine, skip this step.
+
+#### Step B-2: Set up the JDBC driver
+
+The loader requires `db2jcc4.jar`. Set the `CLASSPATH` before running:
+
+```bash
+export CLASSPATH=/path/to/db2jcc4.jar:$CLASSPATH
+```
+
+#### Step B-3: Load the DEL files into Db2WaaS
+
+Run the loader with `--skip-download` to use the local DEL files and `--connection jdbc` to target the Db2WaaS instance:
+
+```bash
+python loader/load_audit_files.py \
+  --connection jdbc \
+  --jdbc-url "jdbc:db2://<waas-host>:50001/BLUDB:sslConnection=true;" \
+  --jdbc-user <waas-user> \
+  --jdbc-password <waas-password> \
+  --skip-download \
+  --local-dir ./del_files \
+  --start-time "2025-01-15 00:00:00" \
+  --end-time "2025-01-15 23:59:59"
+```
+
+Replace `<waas-host>`, `<waas-user>`, and `<waas-password>` with your Db2WaaS connection details. SSL is typically required for Db2WaaS; include `sslConnection=true;` in the JDBC URL.
+
+#### Step B-4: Validate the loaded data
+
+```bash
+python loader/validate_audit_data.py \
+  --connection jdbc \
+  --jdbc-url "jdbc:db2://<waas-host>:50001/BLUDB:sslConnection=true;" \
+  --jdbc-user <waas-user> \
+  --jdbc-password <waas-password> \
+  --start-time "2025-01-15 00:00:00" \
+  --end-time "2025-01-15 23:59:59" \
+  --detailed
+```
+
+---
+
+## 5. If you need binary audit extraction first
 
 If your starting point is binary audit log files rather than pre-extracted `.del` files, use the extraction flow from [`converter/db2audit_converter.py`](../converter/db2audit_converter.py). This must be run on a Db2 server with the required `db2RemStgManager` setup.
 
@@ -274,7 +384,7 @@ python converter/db2audit_converter.py --extract --convert \
 
 ---
 
-## 5. Troubleshooting
+## 6. Troubleshooting
 
 ### No files were downloaded
 
@@ -305,7 +415,7 @@ Check the following:
 
 ---
 
-## 6. Recommended workflow summary
+## 7. Recommended workflow summary
 
 ### To review audit data with SQL in Db2
 
@@ -317,3 +427,15 @@ Check the following:
 
 1. Run [`converter/db2audit_converter.py`](../converter/db2audit_converter.py) with `--download --convert`
 2. Open the generated CSV files in your reporting tool of choice
+
+### To extract on a Db2 server and archive DELs to COS
+
+1. Run [`converter/db2audit_converter.py`](../converter/db2audit_converter.py) with `--extract` on the Db2 server
+2. Upload the resulting DEL files to your COS bucket using an S3-compatible tool
+
+### To extract on a Db2 server and load DELs into Db2WaaS
+
+1. Run [`converter/db2audit_converter.py`](../converter/db2audit_converter.py) with `--extract` on the Db2 server
+2. Transfer the DEL files to the loader machine (or use the same machine)
+3. Run [`loader/load_audit_files.py`](../loader/load_audit_files.py) with `--skip-download --connection jdbc` targeting the Db2WaaS JDBC URL
+4. Run [`loader/validate_audit_data.py`](../loader/validate_audit_data.py) with `--connection jdbc` to confirm data integrity
